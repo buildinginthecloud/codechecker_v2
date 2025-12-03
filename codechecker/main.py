@@ -2,6 +2,7 @@ import os
 import json
 from aws_cdk import (
     Stack,
+    RemovalPolicy,
     aws_codecommit,
     aws_codebuild,
     aws_ec2,
@@ -9,6 +10,7 @@ from aws_cdk import (
     aws_events_targets,
     aws_lambda,
     aws_sns,
+    aws_kms,
     custom_resources,
 )
 from constructs import Construct
@@ -24,6 +26,7 @@ class CodeChecker(Stack):
         repository: aws_codecommit.IRepository = None,
         topic: aws_sns.ITopic = None,
         vpc: aws_ec2.IVpc = None,
+        approver_roles: list = None,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -33,7 +36,28 @@ class CodeChecker(Stack):
                 self, "codechecker-demo", repository_name="codechecker-demo"
             )
         if not topic:
-            topic = aws_sns.Topic(self, "codechecker-demo-topic")
+            # Create KMS key for SNS topic encryption
+            sns_key = aws_kms.Key(
+                self,
+                "SNSTopicKey",
+                description="KMS key for SNS topic encryption",
+                enable_key_rotation=True,
+                removal_policy=RemovalPolicy.RETAIN,
+            )
+            topic = aws_sns.Topic(
+                self,
+                "codechecker-demo-topic",
+                master_key=sns_key,
+            )
+
+        # Create KMS key for Lambda environment encryption
+        lambda_env_key = aws_kms.Key(
+            self,
+            "LambdaEnvKey",
+            description="KMS key for Lambda environment encryption",
+            enable_key_rotation=True,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
 
         # Create a lambda which will publish the codebuild result to codecommit
         publish_codebuild_result_lambda = aws_lambda.Function(
@@ -42,6 +66,7 @@ class CodeChecker(Stack):
             runtime=aws_lambda.Runtime.PYTHON_3_12,
             handler="publish_codebuild_result.lambda_handler",
             code=aws_lambda.Code.from_asset("assets"),
+            environment_encryption=lambda_env_key,
             vpc=vpc,
             vpc_subnets=(
                 None
@@ -59,6 +84,15 @@ class CodeChecker(Stack):
 
         # Starting for loop over dict and create approval templates
         for branch, required_approvals in approvals_per_branch.items():
+            # Create KMS key for CodeBuild encryption
+            codebuild_key = aws_kms.Key(
+                self,
+                f"CodeBuildKey{branch}",
+                description=f"KMS key for CodeBuild project {branch}",
+                enable_key_rotation=True,
+                removal_policy=RemovalPolicy.RETAIN,
+            )
+
             # Create a CodeBuild project which will check the code on a pull request.
             pullrequest_project = aws_codebuild.Project(
                 self,
@@ -67,6 +101,7 @@ class CodeChecker(Stack):
                 environment=aws_codebuild.BuildEnvironment(
                     build_image=aws_codebuild.LinuxBuildImage.STANDARD_7_0
                 ),
+                encryption_key=codebuild_key,
                 build_spec=aws_codebuild.BuildSpec.from_object_to_yaml(
                     {
                         "version": "0.2",
@@ -76,7 +111,7 @@ class CodeChecker(Stack):
                                 "commands": [
                                     "npm install -g aws-cdk",
                                     "pip install git-remote-codecommit",
-                                    "pip install -r requirements.txt",
+                                    "pip install --require-hashes --no-deps -r requirements.txt || pip install -r requirements.txt",
                                 ]
                             },
                             "build": {
@@ -114,6 +149,13 @@ class CodeChecker(Stack):
                 ),
             )
 
+            # Build approver list - use provided roles or just the CodeBuild role
+            approver_list = [
+                f"arn:aws:sts::{Stack.of(self).account}:assumed-role/{pullrequest_project.role.role_name}/*"
+            ]
+            if approver_roles:
+                approver_list.extend(approver_roles)
+
             template = {
                 "Version": "2018-11-08",
                 "DestinationReferences": [f"refs/heads/{branch}"],
@@ -121,10 +163,7 @@ class CodeChecker(Stack):
                     {
                         "Type": "Approvers",
                         "NumberOfApprovalsNeeded": required_approvals,
-                        "ApprovalPoolMembers": [
-                            f"arn:aws:sts::{Stack.of(self).account}:assumed-role/aacb-developer/*",
-                            f"arn:aws:sts::{Stack.of(self).account}:assumed-role/{pullrequest_project.role}/*",
-                        ],
+                        "ApprovalPoolMembers": approver_list,
                     }
                 ],
             }
@@ -159,9 +198,20 @@ class CodeChecker(Stack):
                         "approvalRuleTemplateName": f"{str(required_approvals)}-approval-for-{repository.repository_name}-{branch}"
                     },
                 ),
-                policy=custom_resources.AwsCustomResourcePolicy.from_sdk_calls(
-                    resources=custom_resources.AwsCustomResourcePolicy.ANY_RESOURCE
-                ),
+                policy=custom_resources.AwsCustomResourcePolicy.from_statements([
+                    aws_iam.PolicyStatement(
+                        actions=[
+                            "codecommit:CreateApprovalRuleTemplate",
+                            "codecommit:UpdateApprovalRuleTemplateContent",
+                            "codecommit:DeleteApprovalRuleTemplate",
+                            "codecommit:AssociateApprovalRuleTemplateWithRepository",
+                            "codecommit:DisassociateApprovalRuleTemplateFromRepository",
+                        ],
+                        resources=[
+                            f"arn:aws:codecommit:{Stack.of(self).region}:{Stack.of(self).account}:*"
+                        ],
+                    )
+                ]),
                 vpc=vpc,
                 vpc_subnets=(
                     None
@@ -193,9 +243,20 @@ class CodeChecker(Stack):
                         "repositoryName": repository.repository_name,
                     },
                 ),
-                policy=custom_resources.AwsCustomResourcePolicy.from_sdk_calls(
-                    resources=custom_resources.AwsCustomResourcePolicy.ANY_RESOURCE
-                ),
+                policy=custom_resources.AwsCustomResourcePolicy.from_statements([
+                    aws_iam.PolicyStatement(
+                        actions=[
+                            "codecommit:CreateApprovalRuleTemplate",
+                            "codecommit:UpdateApprovalRuleTemplateContent",
+                            "codecommit:DeleteApprovalRuleTemplate",
+                            "codecommit:AssociateApprovalRuleTemplateWithRepository",
+                            "codecommit:DisassociateApprovalRuleTemplateFromRepository",
+                        ],
+                        resources=[
+                            f"arn:aws:codecommit:{Stack.of(self).region}:{Stack.of(self).account}:*"
+                        ],
+                    )
+                ]),
                 vpc=vpc,
                 vpc_subnets=(
                     None
